@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicLong
 @UnstableApi
 class ParallelSftpSource(
     private val conn: Connection,
-    private val workers: Int = 8,
+    private val workers: Int = 6,
     private val chunkSize: Int = 512 * 1024,
     private val maxAheadBytes: Long = 48L * 1024 * 1024
 ) : BaseDataSource(true) {
@@ -86,24 +86,41 @@ class ParallelSftpSource(
                         if (stopFlag.get()) return@Thread
                         if (chunkIndex < wanted - 2) continue
 
-                        val c = client ?: SFTPv3Client(conn).also { client = it }
-                        val handle = c.openFileRO(path)
-                        try {
-                            val start = chunkIndex * chunkSize.toLong()
-                            val size = minOf(chunkSize.toLong(), fileSize - start).toInt()
-                            if (size <= 0) return@Thread
-                            val data = ByteArray(size)
-                            var got = 0
-                            while (got < size && !stopFlag.get()) {
-                                val n = c.read(handle, start + got, data, got, size - got)
-                                if (n <= 0) break
-                                got += n
+                        var attempt = 0
+                        while (attempt < 3 && !stopFlag.get()) {
+                            try {
+                                val c = client ?: SFTPv3Client(conn).also { client = it }
+                                val handle = c.openFileRO(path)
+                                try {
+                                    val start = chunkIndex * chunkSize.toLong()
+                                    val size = minOf(chunkSize.toLong(), fileSize - start).toInt()
+                                    if (size <= 0) return@Thread
+                                    val data = ByteArray(size)
+                                    var got = 0
+                                    while (got < size && !stopFlag.get()) {
+                                        // מגבלת הספרייה: עד 32KB בכל קריאה
+                                        val want = minOf(RemoteFiles.MAX_SFTP_READ, size - got)
+                                        val n = c.read(handle, start + got, data, got, want)
+                                        if (n <= 0) break
+                                        got += n
+                                    }
+                                    if (got > 0) {
+                                        chunks[chunkIndex] = if (got == size) data else data.copyOf(got)
+                                    }
+                                } finally {
+                                    runCatching { c.closeFile(handle) }
+                                }
+                                break
+                            } catch (t: Throwable) {
+                                attempt++
+                                runCatching { client?.close() }
+                                client = null
+                                if (attempt >= 3) {
+                                    if (!stopFlag.get() && chunks.isEmpty()) failure = t
+                                } else {
+                                    Thread.sleep(150L * attempt)
+                                }
                             }
-                            if (got > 0) {
-                                chunks[chunkIndex] = if (got == size) data else data.copyOf(got)
-                            }
-                        } finally {
-                            runCatching { c.closeFile(handle) }
                         }
                     }
                 } catch (t: Throwable) {

@@ -38,6 +38,9 @@ enum class FileKind(val title: String) {
 /** פעולות קבצים על השרת: סריקה, מחיקה והורדה — בערוץ נפרד, בלי להפריע למסוף. */
 object RemoteFiles {
 
+    /** ספריית ה-SFTP מגבילה כל קריאה ל-32KB — לכן כל קריאה מתבצעת במנות. */
+    const val MAX_SFTP_READ = 32 * 1024
+
     fun quote(path: String) = "'" + path.replace("'", "'\\''") + "'"
 
     /** מריץ פקודה ומחזיר את הפלט המלא. קורא גם stderr כדי שהפקודה לא תיתקע. */
@@ -253,6 +256,15 @@ object RemoteFiles {
         exec(conn, "command -v ffmpeg >/dev/null 2>&1 && echo yes || echo no", 15_000).contains("yes")
     }
 
+    /** תמונה ממוזערת לתמונה גדולה — נוצרת בשרת, כך שעוברים בייתים בודדים. */
+    fun imageThumbnail(conn: Connection, remote: RemoteFile, width: Int = 240): ByteArray? {
+        if (!hasFfmpeg(conn)) return null
+        val cmd = "ffmpeg -nostdin -loglevel quiet -i ${quote(remote.path)} " +
+            "-vf scale=$width:-2 -frames:v 1 -f mjpeg - 2>/dev/null"
+        val bytes = execBinary(conn, cmd, 512 * 1024)
+        return if (bytes.size > 512) bytes else null
+    }
+
     /** תמונה ממוזערת לסרטון — נוצרת בשרת ומגיעה כ-JPEG קטן, בלי להוריד את הסרט. */
     fun videoThumbnail(conn: Connection, remote: RemoteFile): ByteArray? {
         if (!hasFfmpeg(conn)) return null
@@ -270,7 +282,7 @@ object RemoteFiles {
         conn: Connection,
         remote: RemoteFile,
         maxBytes: Long = 40L * 1024 * 1024,
-        parallel: Int = 4,
+        parallel: Int = 3,
         isCancelled: () -> Boolean = { false }
     ): ByteArray? {
         val size = remote.size.coerceAtMost(maxBytes).toInt()
@@ -291,7 +303,8 @@ object RemoteFiles {
                     try {
                         var pos = from
                         while (pos < to && !isCancelled()) {
-                            val n = c.read(handle, pos.toLong(), out, pos, to - pos)
+                            val want = minOf(MAX_SFTP_READ, to - pos)
+                            val n = c.read(handle, pos.toLong(), out, pos, want)
                             if (n <= 0) break
                             pos += n
                         }
@@ -323,7 +336,7 @@ object RemoteFiles {
             val handle = sftp.openFileRO(remote.path)
             dest.parentFile?.mkdirs()
             FileOutputStream(dest).use { fos ->
-                val buf = ByteArray(32 * 1024)
+                val buf = ByteArray(MAX_SFTP_READ)
                 var offset = 0L
                 while (true) {
                     if (isCancelled()) return false

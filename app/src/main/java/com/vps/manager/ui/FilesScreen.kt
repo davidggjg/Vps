@@ -504,7 +504,7 @@ private fun FileRow(
 }
 
 /** מגביל כמה תמונות נמשכות במקביל, כדי שהגלילה תישאר חלקה. */
-private val thumbLimiter = Semaphore(3)
+private val thumbLimiter = Semaphore(2)
 
 private fun dateText(ms: Long): String =
     if (ms <= 0) "—" else SimpleDateFormat("dd/MM/yyyy", Locale("he")).format(Date(ms))
@@ -524,10 +524,12 @@ private fun Thumbnail(file: RemoteFile, kind: FileKind, session: SshSession) {
             runCatching {
                 thumbLimiter.withPermit {
                     if (job?.isActive != true) return@withPermit null
-                    val bytes = if (kind == FileKind.Videos) {
-                        RemoteFiles.videoThumbnail(conn, file)
-                    } else {
-                        RemoteFiles.readToMemory(conn, file, parallel = 2) { job?.isActive != true }
+                    val bytes = when {
+                        kind == FileKind.Videos -> RemoteFiles.videoThumbnail(conn, file)
+                        // תמונה גדולה: מבקשים מהשרת גרסה מוקטנת במקום למשוך הכול
+                        file.size > 1_500_000 -> RemoteFiles.imageThumbnail(conn, file)
+                            ?: RemoteFiles.readToMemory(conn, file, parallel = 2) { job?.isActive != true }
+                        else -> RemoteFiles.readToMemory(conn, file, parallel = 2) { job?.isActive != true }
                     } ?: return@withPermit null
 
                     val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
