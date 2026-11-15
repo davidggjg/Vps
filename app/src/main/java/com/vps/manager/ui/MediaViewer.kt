@@ -64,7 +64,7 @@ fun MediaViewerDialog(
     remote: RemoteFile,
     kind: FileKind,
     state: LoadState,
-    connection: Connection?,
+    session: com.vps.manager.ssh.SshSession?,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
     onRetry: () -> Unit
@@ -107,10 +107,10 @@ fun MediaViewerDialog(
         ) {
             when (state) {
                 is LoadState.Streaming ->
-                    if (connection != null) {
+                    if (session != null) {
                         StreamPlayer(
                             remote = remote,
-                            conn = connection,
+                            session = session,
                             onPlayerReady = { playerRef = it }
                         )
                     } else {
@@ -231,40 +231,49 @@ private fun BoxScope.CenterMessage(text: String) {
     Text(text, Modifier.align(Alignment.Center), color = Color.White)
 }
 
-/** נגן שמזרים מהשרת בכמה ערוצים במקביל — התחלה מיידית וגם דילוג מהיר. */
+/** נגן שמזרים מהשרת בכמה ערוצים וחיבורים במקביל — התחלה מיידית ודילוג מהיר. */
 @OptIn(UnstableApi::class)
 @Composable
 private fun StreamPlayer(
     remote: RemoteFile,
-    conn: Connection,
+    session: com.vps.manager.ssh.SshSession,
     onPlayerReady: (ExoPlayer) -> Unit
 ) {
     val context = LocalContext.current
-    var error by remember { mutableStateOf<String?>(null) }
+    var error by remember(remote.path) { mutableStateOf<String?>(null) }
+    var player by remember(remote.path) { mutableStateOf<ExoPlayer?>(null) }
+    var preparing by remember(remote.path) { mutableStateOf(true) }
 
-    val player = remember(remote.path) {
-        ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(ParallelSftpSource.factory(conn)))
+    LaunchedEffect(remote.path) {
+        // פתיחת חיבורי ההעברה וחיפוש כתוביות נעשים מחוץ למסך הראשי
+        val conns = withContext(Dispatchers.IO) {
+            runCatching { session.transferConnections() }.getOrDefault(emptyList())
+        }
+        if (conns.isEmpty()) {
+            error = "אין חיבור פעיל לשרת"
+            preparing = false
+            return@LaunchedEffect
+        }
+        val subs = withContext(Dispatchers.IO) {
+            runCatching { RemoteFiles.siblingSubtitles(conns[0], remote) }.getOrDefault(emptyList())
+        }
+
+        val built = ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(ParallelSftpSource.factory(conns)))
             .setLoadControl(
                 DefaultLoadControl.Builder()
                     .setBufferDurationsMs(10_000, 120_000, 600, 1_500)
                     .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
             )
-            .build().apply {
-                addListener(object : androidx.media3.common.Player.Listener {
-                    override fun onPlayerError(e: androidx.media3.common.PlaybackException) {
-                        error = "לא ניתן לנגן את הקובץ: ${e.errorCodeName}"
-                    }
-                })
-            }
-    }
+            .build()
 
-    // מחפשים קובצי כתוביות לצד הסרט ומצרפים אותם
-    LaunchedEffect(remote.path) {
-        val subs = withContext(Dispatchers.IO) {
-            runCatching { RemoteFiles.siblingSubtitles(conn, remote) }.getOrDefault(emptyList())
-        }
+        built.addListener(object : androidx.media3.common.Player.Listener {
+            override fun onPlayerError(e: androidx.media3.common.PlaybackException) {
+                error = "לא ניתן לנגן את הקובץ: ${e.errorCodeName}"
+            }
+        })
+
         val item = MediaItem.Builder()
             .setUri(ParallelSftpSource.uriFor(remote.path))
             .setSubtitleConfigurations(
@@ -278,33 +287,49 @@ private fun StreamPlayer(
                             }
                         )
                         .setLabel(sub.substringAfterLast('/'))
-                        .setSelectionFlags(0)
                         .build()
                 }
             )
             .build()
-        player.setMediaItem(item)
-        player.prepare()
-        player.playWhenReady = true
-        onPlayerReady(player)
+
+        built.setMediaItem(item)
+        built.prepare()
+        built.playWhenReady = true
+        player = built
+        preparing = false
+        onPlayerReady(built)
     }
 
-    DisposableEffect(remote.path) { onDispose { player.release() } }
+    DisposableEffect(remote.path) {
+        onDispose { player?.release() }
+    }
 
     Box(Modifier.fillMaxSize()) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    this.player = player
-                    useController = true
-                    controllerShowTimeoutMs = 3500
-                    setShowSubtitleButton(true)
-                    setKeepContentOnPlayerReset(true)
-                    keepScreenOn = true
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        val p = player
+        if (p != null) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        useController = true
+                        controllerShowTimeoutMs = 3500
+                        setShowSubtitleButton(true)
+                        setKeepContentOnPlayerReset(true)
+                        keepScreenOn = true
+                    }
+                },
+                update = { view -> view.player = p },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else if (preparing) {
+            Column(
+                Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                CircularProgressIndicator(color = Ios.blue)
+                Spacer(Modifier.height(10.dp))
+                Text("מתחבר לשרת…", color = Color.White.copy(alpha = 0.8f))
+            }
+        }
         error?.let {
             Column(
                 Modifier.align(Alignment.Center).padding(24.dp),

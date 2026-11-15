@@ -427,7 +427,7 @@ fun FilesScreen(
             remote = current,
             kind = kind,
             state = ls,
-            connection = session.connection(),
+            session = session,
             onCancel = {
                 cancelDownload = true
                 viewing = null
@@ -459,14 +459,14 @@ private fun FileRow(
     Row(
         Modifier
             .fillMaxWidth()
-            .glass(radius = 18.dp)
+            .glass(radius = 20.dp)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .background(if (selected) Ios.blue.copy(alpha = 0.18f) else Color.Transparent)
-            .padding(10.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Thumbnail(file, kind, session)
-        Spacer(Modifier.width(10.dp))
+        Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Text(
@@ -548,8 +548,8 @@ private fun Thumbnail(file: RemoteFile, kind: FileKind, session: SshSession) {
 
     Box(
         Modifier
-            .size(52.dp)
-            .clip(RoundedCornerShape(12.dp))
+            .size(60.dp)
+            .clip(RoundedCornerShape(14.dp))
             .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)),
         contentAlignment = Alignment.Center
     ) {

@@ -177,6 +177,7 @@ class SshSession(
     }
 
     private fun teardown() {
+        closeTransferConnections()
         runCatching { shell?.close() }
         runCatching { conn?.close() }
         shell = null; conn = null; stdin = null
@@ -254,6 +255,44 @@ class SshSession(
     /** החיבור הפתוח — לשימוש פעולות קבצים (SFTP/exec) על אותו ערוץ מאובטח. */
     fun connection(): Connection? = conn
 
+    // חיבורים נוספים להעברת קבצים. כל חיבור SSH מוגבל במספר ערוצים ובגודל חלון,
+    // ולכן כמה חיבורים במקביל מכפילים את מהירות ההזרמה.
+    private val transferConns = arrayOfNulls<Connection>(TRANSFER_CONNECTIONS)
+
+    @Synchronized
+    private fun transferConnection(index: Int): Connection? {
+        transferConns[index]?.let { existing ->
+            if (runCatching { existing.sendIgnorePacket(); true }.getOrDefault(false)) return existing
+            runCatching { existing.close() }
+            transferConns[index] = null
+        }
+        val s = server
+        return runCatching {
+            val c = Connection(s.host, s.port)
+            c.connect({ _, _, _, _ -> true }, 15_000, 20_000)
+            val ok = if (s.usesKey)
+                c.authenticateWithPublicKey(s.user, s.privateKey.toCharArray(), s.keyPassphrase.ifBlank { null })
+            else
+                c.authenticateWithPassword(s.user, s.password)
+            if (!ok) { c.close(); null } else { transferConns[index] = c; c }
+        }.getOrNull()
+    }
+
+    /** כל החיבורים שאפשר להשתמש בהם להעברת קבצים — הראשי ועוד כמה. */
+    fun transferConnections(): List<Connection> {
+        val main = conn ?: return emptyList()
+        val extra = (0 until TRANSFER_CONNECTIONS).mapNotNull { transferConnection(it) }
+        return listOf(main) + extra
+    }
+
+    @Synchronized
+    private fun closeTransferConnections() {
+        transferConns.indices.forEach { i ->
+            runCatching { transferConns[i]?.close() }
+            transferConns[i] = null
+        }
+    }
+
     fun clearBlocks() { _blocks.value = emptyList() }
 
     fun removeBlock(id: Long) { _blocks.value = _blocks.value.filterNot { it.id == id } }
@@ -329,6 +368,9 @@ class SshSession(
     }
 
     companion object {
+        /** מספר חיבורי ההעברה הנוספים (מעבר לחיבור הראשי). */
+        const val TRANSFER_CONNECTIONS = 2
+
         fun shellQuote(s: String) = "'" + s.replace("'", "'\\''") + "'"
     }
 }
