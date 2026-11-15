@@ -36,6 +36,7 @@ class MainActivity : ComponentActivity() {
             VpsTheme {
                 val servers by store.servers.collectAsState()
                 var openId by remember { mutableStateOf<String?>(null) }
+                var filesOpen by remember { mutableStateOf(false) }
                 val context = LocalContext.current
 
                 val open = servers.firstOrNull { it.id == openId }
@@ -57,12 +58,21 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     val session = remember(open.id) { SshManager.session(context, open) }
-                    BackHandler { openId = null }
-                    TerminalScreen(
-                        server = open,
-                        session = session,
-                        onBack = { openId = null }
-                    )
+                    if (filesOpen) {
+                        BackHandler { filesOpen = false }
+                        com.vps.manager.ui.FilesScreen(
+                            session = session,
+                            onBack = { filesOpen = false }
+                        )
+                    } else {
+                        BackHandler { openId = null }
+                        TerminalScreen(
+                            server = open,
+                            session = session,
+                            onBack = { openId = null },
+                            onOpenFiles = { filesOpen = true }
+                        )
+                    }
                 }
             }
         }

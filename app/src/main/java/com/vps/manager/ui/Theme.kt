@@ -8,7 +8,9 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -64,21 +66,35 @@ private val typography = Typography(
     labelMedium = TextStyle(fontWeight = FontWeight.Medium, fontSize = 12.sp, letterSpacing = 0.sp)
 )
 
-val MonoStyle = TextStyle(
-    fontFamily = FontFamily.Monospace,
-    fontSize = 13.sp,
-    lineHeight = 19.sp
-)
+/** גודל גופן המסוף שהמשתמש בחר (ניתן לשינוי מהתפריט). */
+val LocalTerminalFontSize = androidx.compose.runtime.compositionLocalOf { 13f }
+
+/** סגנון המסוף — מתעדכן לפי הבחירה של המשתמש. */
+val MonoStyle: TextStyle
+    @Composable get() {
+        val size = LocalTerminalFontSize.current
+        return TextStyle(
+            fontFamily = FontFamily.Monospace,
+            fontSize = size.sp,
+            lineHeight = (size * 1.45f).sp
+        )
+    }
 
 /** כל האפליקציה בעברית ומימין לשמאל, גם אם הטלפון באנגלית. */
 @Composable
 fun VpsTheme(content: @Composable () -> Unit) {
     val dark = isSystemInDarkTheme()
+    // מכבדים את גודל הגופן של הטלפון, אבל מגבילים אותו כדי שהמסך לא יישבר.
+    val d = LocalDensity.current
+    val safeDensity = Density(d.density, d.fontScale.coerceIn(0.85f, 1.15f))
     MaterialTheme(
         colorScheme = if (dark) darkScheme else lightScheme,
         typography = typography
     ) {
-        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        CompositionLocalProvider(
+            LocalLayoutDirection provides LayoutDirection.Rtl,
+            LocalDensity provides safeDensity
+        ) {
             content()
         }
     }

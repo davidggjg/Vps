@@ -251,6 +251,9 @@ class SshSession(
 
     private fun writeLine(line: String) = sendRaw(line + "\n")
 
+    /** החיבור הפתוח — לשימוש פעולות קבצים (SFTP/exec) על אותו ערוץ מאובטח. */
+    fun connection(): Connection? = conn
+
     fun clearBlocks() { _blocks.value = emptyList() }
 
     fun removeBlock(id: Long) { _blocks.value = _blocks.value.filterNot { it.id == id } }

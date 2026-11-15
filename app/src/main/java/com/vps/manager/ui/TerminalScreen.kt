@@ -28,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.vps.manager.data.Server
 import com.vps.manager.ssh.CommandBlock
 import com.vps.manager.ssh.ConnState
@@ -41,7 +42,8 @@ private const val COLLAPSE_LINES = 40
 fun TerminalScreen(
     server: Server,
     session: SshSession,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onOpenFiles: () -> Unit
 ) {
     val state = session.state.collectAsState().value
     val status = session.status.collectAsState().value
@@ -81,147 +83,153 @@ fun TerminalScreen(
         if (blocks.isNotEmpty() && !searchOpen) listState.animateScrollToItem(shown.lastIndex.coerceAtLeast(0))
     }
 
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember { com.vps.manager.data.Prefs.get(context) }
+    var fontSize by remember { mutableFloatStateOf(prefs.terminalFontSize) }
+
+    CompositionLocalProvider(LocalTerminalFontSize provides fontSize) {
     GlassBackground {
-        Scaffold(
-            containerColor = Color.Transparent,
-            snackbarHost = { SnackbarHost(snackbar) },
-            topBar = {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(start = 12.dp, end = 12.dp, top = 44.dp, bottom = 8.dp)
-                        .glass(radius = 22.dp)
-                        .padding(horizontal = 12.dp, vertical = 10.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onBack) {
-                            Icon(Icons.Rounded.ArrowForward, contentDescription = "חזרה")
-                        }
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                server.name.ifBlank { server.host },
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                status,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1
-                            )
-                        }
-                        StatusPill(state)
-                        IconButton(onClick = { searchOpen = !searchOpen }) {
-                            Icon(
-                                if (searchOpen) Icons.Rounded.SearchOff else Icons.Rounded.Search,
-                                contentDescription = "חיפוש"
-                            )
-                        }
-                        var menu by remember { mutableStateOf(false) }
-                        IconButton(onClick = { menu = true }) {
-                            Icon(Icons.Rounded.MoreVert, contentDescription = "עוד")
-                        }
-                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                            DropdownMenuItem(
-                                text = { Text("העתקת כל המסוף") },
-                                leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) },
-                                onClick = {
-                                    menu = false
-                                    copy(blocks.joinToString("\n\n") { it.asText() }, "כל המסוף")
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("ניקוי המסך") },
-                                leadingIcon = { Icon(Icons.Rounded.CleaningServices, null) },
-                                onClick = { menu = false; session.clearBlocks() }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("חיבור מחדש") },
-                                leadingIcon = { Icon(Icons.Rounded.Refresh, null) },
-                                onClick = { menu = false; session.onNetworkChanged(true); session.connect() }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("סגירת החיבור") },
-                                leadingIcon = { Icon(Icons.Rounded.LinkOff, null) },
-                                onClick = { menu = false; session.disconnect() }
-                            )
-                        }
+        Column(
+            Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .imePadding()
+        ) {
+            // ----- סרגל עליון -----
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .glass(radius = 20.dp)
+                    .padding(horizontal = 6.dp, vertical = 6.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onBack, modifier = Modifier.size(38.dp)) {
+                        Icon(Icons.Rounded.ArrowForward, contentDescription = "חזרה", modifier = Modifier.size(20.dp))
                     }
-
-                    AnimatedVisibility(visible = searchOpen) {
-                        Column {
-                            Spacer(Modifier.height(6.dp))
-                            OutlinedTextField(
-                                value = query,
-                                onValueChange = { query = it },
-                                placeholder = { Text("חיפוש מילה בכל הפלט…") },
-                                leadingIcon = { Icon(Icons.Rounded.Search, null) },
-                                trailingIcon = {
-                                    if (query.isNotEmpty()) {
-                                        IconButton(onClick = { query = "" }) {
-                                            Icon(Icons.Rounded.Close, "ניקוי")
-                                        }
-                                    }
-                                },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(16.dp)
-                            )
-                            if (query.isNotBlank()) {
-                                Spacer(Modifier.height(4.dp))
-                                Text(
-                                    "נמצאו $matchCount תוצאות ב-${shown.size} פקודות",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(4.dp))
-                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
                         Text(
-                            "${server.user}@${server.host}  ·  $cwd",
-                            style = MonoStyle,
+                            server.name.ifBlank { server.host },
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                        )
+                        Text(
+                            status,
+                            style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                        )
+                    }
+                    StatusPill(state)
+                    IconButton(onClick = onOpenFiles, modifier = Modifier.size(38.dp)) {
+                        Icon(Icons.Rounded.PermMedia, contentDescription = "קבצים ומדיה", modifier = Modifier.size(20.dp))
+                    }
+                    IconButton(onClick = { searchOpen = !searchOpen }, modifier = Modifier.size(38.dp)) {
+                        Icon(
+                            if (searchOpen) Icons.Rounded.SearchOff else Icons.Rounded.Search,
+                            contentDescription = "חיפוש",
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    var menu by remember { mutableStateOf(false) }
+                    IconButton(onClick = { menu = true }, modifier = Modifier.size(38.dp)) {
+                        Icon(Icons.Rounded.MoreVert, contentDescription = "עוד", modifier = Modifier.size(20.dp))
+                    }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("העתקת כל המסוף") },
+                            leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) },
+                            onClick = {
+                                menu = false
+                                copy(blocks.joinToString("\n\n") { it.asText() }, "כל המסוף")
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("הגדלת הגופן") },
+                            leadingIcon = { Icon(Icons.Rounded.TextIncrease, null) },
+                            onClick = {
+                                fontSize = (fontSize + 1f).coerceAtMost(22f)
+                                prefs.terminalFontSize = fontSize
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("הקטנת הגופן") },
+                            leadingIcon = { Icon(Icons.Rounded.TextDecrease, null) },
+                            onClick = {
+                                fontSize = (fontSize - 1f).coerceAtLeast(9f)
+                                prefs.terminalFontSize = fontSize
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("ניקוי המסך") },
+                            leadingIcon = { Icon(Icons.Rounded.CleaningServices, null) },
+                            onClick = { menu = false; session.clearBlocks() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("חיבור מחדש") },
+                            leadingIcon = { Icon(Icons.Rounded.Refresh, null) },
+                            onClick = { menu = false; session.onNetworkChanged(true); session.connect() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("סגירת החיבור") },
+                            leadingIcon = { Icon(Icons.Rounded.LinkOff, null) },
+                            onClick = { menu = false; session.disconnect() }
                         )
                     }
                 }
-            },
-            bottomBar = {
-                CommandBar(
-                    input = input,
-                    onInput = { input = it; historyIndex = -1 },
-                    enabled = state == ConnState.Connected,
-                    onSend = {
-                        val cmd = input.trim()
-                        if (cmd.isNotEmpty()) {
-                            session.run(cmd)
-                            input = ""
-                            historyIndex = -1
-                            searchOpen = false
-                        }
-                    },
-                    onCtrlC = { session.sendCtrlC() },
-                    onHistory = {
-                        if (history.isNotEmpty()) {
-                            historyIndex = (historyIndex + 1).coerceAtMost(history.lastIndex)
-                            input = history[history.lastIndex - historyIndex]
+
+                AnimatedVisibility(visible = searchOpen) {
+                    Column(Modifier.padding(horizontal = 4.dp)) {
+                        Spacer(Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            placeholder = { Text("חיפוש מילה בכל הפלט…", maxLines = 1) },
+                            leadingIcon = { Icon(Icons.Rounded.Search, null, modifier = Modifier.size(18.dp)) },
+                            trailingIcon = {
+                                if (query.isNotEmpty()) {
+                                    IconButton(onClick = { query = "" }) {
+                                        Icon(Icons.Rounded.Close, "ניקוי", modifier = Modifier.size(18.dp))
+                                    }
+                                }
+                            },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            textStyle = MaterialTheme.typography.bodyMedium
+                        )
+                        if (query.isNotBlank()) {
+                            Text(
+                                "נמצאו $matchCount תוצאות ב-${shown.size} פקודות",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)
+                            )
                         }
                     }
-                )
+                }
+
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    Text(
+                        "${server.user}@${server.host}  ·  $cwd",
+                        style = MonoStyle.copy(fontSize = (fontSize - 2f).coerceAtLeast(9f).sp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
             }
-        ) { padding ->
+
+            // ----- רשימת הפקודות -----
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(
-                    top = padding.calculateTopPadding() + 8.dp,
-                    bottom = padding.calculateBottomPadding() + 16.dp,
-                    start = 12.dp, end = 12.dp
-                ),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 4.dp, bottom = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(shown, key = { it.id }) { block ->
                     BlockCard(
@@ -248,7 +256,33 @@ fun TerminalScreen(
                     }
                 }
             }
+
+            // ----- שורת הפקודה -----
+            CommandBar(
+                input = input,
+                onInput = { input = it; historyIndex = -1 },
+                enabled = state == ConnState.Connected,
+                onSend = {
+                    val cmd = input.trim()
+                    if (cmd.isNotEmpty()) {
+                        session.run(cmd)
+                        input = ""
+                        historyIndex = -1
+                        searchOpen = false
+                    }
+                },
+                onCtrlC = { session.sendCtrlC() },
+                onHistory = {
+                    if (history.isNotEmpty()) {
+                        historyIndex = (historyIndex + 1).coerceAtMost(history.lastIndex)
+                        input = history[history.lastIndex - historyIndex]
+                    }
+                }
+            )
         }
+
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
+    }
     }
 
     blockSearch?.let { b ->
@@ -437,26 +471,27 @@ private fun CommandBar(
     Row(
         Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 28.dp)
-            .glass(radius = 26.dp)
-            .padding(horizontal = 8.dp, vertical = 8.dp),
+            .navigationBarsPadding()
+            .padding(horizontal = 10.dp)
+            .padding(bottom = 8.dp)
+            .glass(radius = 24.dp)
+            .padding(horizontal = 4.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        IconButton(onClick = onHistory) {
+        IconButton(onClick = onHistory, modifier = Modifier.size(40.dp)) {
             Icon(Icons.Rounded.History, "פקודה קודמת", tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
             BasicTextFieldRow(input, onInput, enabled, onSend)
         }
-        IconButton(onClick = onCtrlC) {
+        IconButton(onClick = onCtrlC, modifier = Modifier.size(40.dp)) {
             Icon(Icons.Rounded.Stop, "עצירה (Ctrl+C)", tint = Ios.red)
         }
         IconButton(
             onClick = onSend,
             enabled = enabled && input.isNotBlank(),
             modifier = Modifier
-                .size(42.dp)
+                .size(40.dp)
                 .clip(RoundedCornerShape(21.dp))
                 .background(if (enabled && input.isNotBlank()) Ios.blue else Ios.gray.copy(alpha = 0.3f))
         ) {
