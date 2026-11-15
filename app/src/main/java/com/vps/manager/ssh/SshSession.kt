@@ -67,7 +67,9 @@ class SshSession(
             return
         }
         when (_state.value) {
-            ConnState.Connected -> if (!ping()) scheduleReconnect("הרשת התחלפה")
+            ConnState.Connected -> Thread {
+                if (!ping()) scheduleReconnect("הרשת התחלפה")
+            }.apply { isDaemon = true }.start()
             ConnState.Failed, ConnState.Disconnected -> {
                 reconnectAttempt = 0
                 scheduleReconnect("הרשת חזרה")
@@ -78,7 +80,7 @@ class SshSession(
     }
 
     private fun ping(): Boolean = try {
-        conn?.sendIgnorePacket(); true
+        conn?.ping(); true
     } catch (t: Throwable) { false }
 
     private fun startConnectThread(isRetry: Boolean) {
@@ -146,7 +148,9 @@ class SshSession(
                 return true
             }
         }, 15_000, 20_000)
-        c.setTCPNoDelay(true)
+        c.addConnectionMonitor { cause ->
+            if (wanted && conn === c) scheduleReconnect(cause?.message ?: "החיבור נסגר")
+        }
 
         val ok = if (s.usesKey)
             c.authenticateWithPublicKey(s.user, s.privateKey.toCharArray(), s.keyPassphrase.ifBlank { null })
@@ -214,7 +218,7 @@ class SshSession(
             while (wanted && conn === c) {
                 try { Thread.sleep(20_000) } catch (_: InterruptedException) { return@Thread }
                 if (conn !== c) return@Thread
-                try { c.sendIgnorePacket() } catch (_: Throwable) {
+                try { c.ping() } catch (_: Throwable) {
                     if (wanted && conn === c) scheduleReconnect("אין תגובה מהשרת")
                     return@Thread
                 }
