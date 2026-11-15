@@ -12,17 +12,29 @@ android {
         applicationId = "com.vps.manager"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // מספר הגרסה עולה בכל בנייה, כדי שאנדרואיד יזהה עדכון
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionName = "1.0." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+    }
+
+    // מפתח חתימה קבוע — בלעדיו כל בנייה נחתמת אחרת ואי אפשר לעדכן בלי להסיר
+    signingConfigs {
+        create("vps") {
+            storeFile = file("signing/vps.jks")
+            storePassword = "vpsmanager"
+            keyAlias = "vps"
+            keyPassword = "vpsmanager"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("vps")
         }
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("vps")
         }
     }
 
