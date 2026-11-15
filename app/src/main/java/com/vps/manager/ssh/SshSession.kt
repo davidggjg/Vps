@@ -177,6 +177,7 @@ class SshSession(
     }
 
     private fun teardown() {
+        conn?.let { SftpPool.release(it) }
         closeTransferConnections()
         runCatching { shell?.close() }
         runCatching { conn?.close() }
@@ -288,6 +289,7 @@ class SshSession(
     @Synchronized
     private fun closeTransferConnections() {
         transferConns.indices.forEach { i ->
+            transferConns[i]?.let { SftpPool.release(it) }
             runCatching { transferConns[i]?.close() }
             transferConns[i] = null
         }

@@ -189,28 +189,6 @@ object RemoteFiles {
     fun delete(conn: Connection, paths: List<String>): String =
         exec(conn, "rm -f -- " + paths.joinToString(" ") { quote(it) } + " && echo OK")
 
-    @Volatile private var cachedConn: Connection? = null
-    @Volatile private var cachedSftp: SFTPv3Client? = null
-
-    /** לקוח SFTP משותף — פתיחת ערוץ חדש לכל תמונה היא מה שמאט. */
-    @Synchronized
-    private fun sftp(conn: Connection): SFTPv3Client {
-        val existing = cachedSftp
-        if (existing != null && cachedConn === conn) return existing
-        runCatching { existing?.close() }
-        val fresh = SFTPv3Client(conn)
-        cachedConn = conn
-        cachedSftp = fresh
-        return fresh
-    }
-
-    @Synchronized
-    fun dropCache() {
-        runCatching { cachedSftp?.close() }
-        cachedSftp = null
-        cachedConn = null
-    }
-
     /** מריץ פקודה ומחזיר פלט בינארי (למשל תמונה שה-ffmpeg של השרת מייצר). */
     fun execBinary(conn: Connection, command: String, maxBytes: Int = 4 * 1024 * 1024): ByteArray {
         val session = conn.openSession()
@@ -296,25 +274,23 @@ object RemoteFiles {
                 val from = i * slice
                 val to = minOf(size, from + slice)
                 if (from >= to) return@Thread
-                var client: SFTPv3Client? = null
                 try {
-                    val c = SFTPv3Client(conn).also { client = it }
-                    val handle = c.openFileRO(remote.path)
-                    try {
-                        var pos = from
-                        while (pos < to && !isCancelled()) {
-                            val want = minOf(MAX_SFTP_READ, to - pos)
-                            val n = c.read(handle, pos.toLong(), out, pos, want)
-                            if (n <= 0) break
-                            pos += n
+                    SftpPool.withClient(conn) { c ->
+                        val handle = c.openFileRO(remote.path)
+                        try {
+                            var pos = from
+                            while (pos < to && !isCancelled()) {
+                                val want = minOf(MAX_SFTP_READ, to - pos)
+                                val n = c.read(handle, pos.toLong(), out, pos, want)
+                                if (n < 0) break
+                                pos += n
+                            }
+                        } finally {
+                            runCatching { c.closeFile(handle) }
                         }
-                    } finally {
-                        runCatching { c.closeFile(handle) }
                     }
                 } catch (t: Throwable) {
                     errors.set(t)
-                } finally {
-                    runCatching { client?.close() }
                 }
             }.apply { isDaemon = true; start() }
         }
@@ -331,27 +307,26 @@ object RemoteFiles {
         onProgress: (Long, Long) -> Unit,
         isCancelled: () -> Boolean
     ): Boolean {
-        val sftp = sftp(conn)
-        try {
+        return SftpPool.withClient(conn) { sftp ->
             val handle = sftp.openFileRO(remote.path)
-            dest.parentFile?.mkdirs()
-            FileOutputStream(dest).use { fos ->
-                val buf = ByteArray(MAX_SFTP_READ)
-                var offset = 0L
-                while (true) {
-                    if (isCancelled()) return false
-                    val n = sftp.read(handle, offset, buf, 0, buf.size)
-                    if (n <= 0) break
-                    fos.write(buf, 0, n)
-                    offset += n
-                    onProgress(offset, remote.size)
+            try {
+                dest.parentFile?.mkdirs()
+                FileOutputStream(dest).use { fos ->
+                    val buf = ByteArray(MAX_SFTP_READ)
+                    var offset = 0L
+                    while (true) {
+                        if (isCancelled()) return@withClient false
+                        val n = sftp.read(handle, offset, buf, 0, buf.size)
+                        if (n <= 0) break
+                        fos.write(buf, 0, n)
+                        offset += n
+                        onProgress(offset, remote.size)
+                    }
                 }
+                true
+            } finally {
+                runCatching { sftp.closeFile(handle) }
             }
-            runCatching { sftp.closeFile(handle) }
-            return true
-        } catch (t: Throwable) {
-            dropCache()
-            throw t
         }
     }
 }

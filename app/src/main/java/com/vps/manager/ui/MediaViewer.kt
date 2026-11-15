@@ -42,6 +42,7 @@ import androidx.media3.ui.TrackSelectionDialogBuilder
 import com.trilead.ssh2.Connection
 import com.vps.manager.ssh.FileKind
 import com.vps.manager.ssh.ParallelSftpSource
+import com.vps.manager.ssh.SftpSourceFactory
 import com.vps.manager.ssh.RemoteFile
 import com.vps.manager.ssh.RemoteFiles
 import com.vps.manager.ssh.humanSize
@@ -243,6 +244,7 @@ private fun StreamPlayer(
     var error by remember(remote.path) { mutableStateOf<String?>(null) }
     var player by remember(remote.path) { mutableStateOf<ExoPlayer?>(null) }
     var preparing by remember(remote.path) { mutableStateOf(true) }
+    var sourceFactory by remember(remote.path) { mutableStateOf<SftpSourceFactory?>(null) }
 
     LaunchedEffect(remote.path) {
         // פתיחת חיבורי ההעברה וחיפוש כתוביות נעשים מחוץ למסך הראשי
@@ -258,8 +260,11 @@ private fun StreamPlayer(
             runCatching { RemoteFiles.siblingSubtitles(conns[0], remote) }.getOrDefault(emptyList())
         }
 
+        val factory = SftpSourceFactory(conns, remote.path)
+        sourceFactory = factory
+
         val built = ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(ParallelSftpSource.factory(conns)))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(factory))
             .setLoadControl(
                 DefaultLoadControl.Builder()
                     .setBufferDurationsMs(10_000, 120_000, 600, 1_500)
@@ -301,7 +306,12 @@ private fun StreamPlayer(
     }
 
     DisposableEffect(remote.path) {
-        onDispose { player?.release() }
+        onDispose {
+            player?.release()
+            // סגירה מסודרת של הערוצים, אחרת החיבור לשרת עלול ליפול
+            val f = sourceFactory
+            Thread { runCatching { f?.release() } }.apply { isDaemon = true }.start()
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
