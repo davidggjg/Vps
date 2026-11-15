@@ -65,5 +65,4 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     implementation("org.connectbot:sshlib:2.2.23")
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 }

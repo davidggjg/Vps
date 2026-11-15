@@ -1,8 +1,6 @@
 package com.vps.manager.data
 
 import android.content.Context
-import androidx.security.crypto.EncryptedFile
-import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
@@ -20,27 +18,16 @@ class ServerStore(private val context: Context) {
         _servers.value = runCatching { load() }.getOrElse { emptyList() }
     }
 
-    private fun encryptedFile(): EncryptedFile {
-        val key = MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        return EncryptedFile.Builder(
-            context, file, key, EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
-        ).build()
-    }
-
     private fun load(): List<Server> {
         if (!file.exists()) return emptyList()
-        val text = encryptedFile().openFileInput().use { it.readBytes().toString(Charsets.UTF_8) }
+        val text = Crypto.decrypt(file.readBytes()).toString(Charsets.UTF_8)
         val arr = JSONArray(text)
         return (0 until arr.length()).map { Server.fromJson(arr.getJSONObject(it)) }
     }
 
     private fun persist(list: List<Server>) {
-        if (file.exists()) file.delete()
-        encryptedFile().openFileOutput().use {
-            it.write(list.toJsonArray().toString().toByteArray(Charsets.UTF_8))
-        }
+        val json = list.toJsonArray().toString().toByteArray(Charsets.UTF_8)
+        file.writeBytes(Crypto.encrypt(json))
     }
 
     fun save(server: Server) {
