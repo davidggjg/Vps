@@ -1,0 +1,38 @@
+name: בניית אפליקציה
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: התקנת Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: הגדרת Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: בניית APK
+        run: gradle --no-daemon assembleDebug assembleRelease
+
+      - name: העלאת ה-APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-manager-apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
