@@ -5,6 +5,7 @@ import com.trilead.ssh2.SFTPv3Client
 import com.trilead.ssh2.StreamGobbler
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.ConcurrentHashMap
 
 /** קובץ שנמצא על השרת. */
 data class RemoteFile(
@@ -205,6 +206,108 @@ object RemoteFiles {
         runCatching { cachedSftp?.close() }
         cachedSftp = null
         cachedConn = null
+    }
+
+    /** מריץ פקודה ומחזיר פלט בינארי (למשל תמונה שה-ffmpeg של השרת מייצר). */
+    fun execBinary(conn: Connection, command: String, maxBytes: Int = 4 * 1024 * 1024): ByteArray {
+        val session = conn.openSession()
+        try {
+            session.execCommand(command)
+            val out = StreamGobbler(session.stdout)
+            val err = StreamGobbler(session.stderr)
+            Thread {
+                val b = ByteArray(8192)
+                try { while (err.read(b) >= 0) { /* נזרק */ } } catch (_: Throwable) {}
+            }.apply { isDaemon = true; start() }
+            val bos = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(32 * 1024)
+            while (bos.size() < maxBytes) {
+                val n = out.read(buf)
+                if (n < 0) break
+                bos.write(buf, 0, n)
+            }
+            return bos.toByteArray()
+        } finally {
+            runCatching { session.close() }
+        }
+    }
+
+    /** קובצי כתוביות שנמצאים ליד הסרט ונושאים את אותו שם. */
+    fun siblingSubtitles(conn: Connection, remote: RemoteFile): List<String> {
+        val base = remote.name.substringBeforeLast('.')
+        val out = exec(
+            conn,
+            "find ${quote(remote.folder)} -maxdepth 1 -type f " +
+                "\\( -iname '*.srt' -o -iname '*.vtt' -o -iname '*.ass' -o -iname '*.ssa' \\) 2>/dev/null | head -n 20",
+            20_000
+        )
+        val all = out.lines().filter { it.isNotBlank() }
+        val same = all.filter { it.substringAfterLast('/').startsWith(base, ignoreCase = true) }
+        return if (same.isNotEmpty()) same else all
+    }
+
+    private val ffmpegCache = ConcurrentHashMap<Connection, Boolean>()
+
+    /** בודק פעם אחת אם יש ffmpeg בשרת — כך אפשר ליצור תמונות ממוזערות לסרטונים. */
+    fun hasFfmpeg(conn: Connection): Boolean = ffmpegCache.getOrPut(conn) {
+        exec(conn, "command -v ffmpeg >/dev/null 2>&1 && echo yes || echo no", 15_000).contains("yes")
+    }
+
+    /** תמונה ממוזערת לסרטון — נוצרת בשרת ומגיעה כ-JPEG קטן, בלי להוריד את הסרט. */
+    fun videoThumbnail(conn: Connection, remote: RemoteFile): ByteArray? {
+        if (!hasFfmpeg(conn)) return null
+        val cmd = "ffmpeg -nostdin -loglevel quiet -ss 20 -i ${quote(remote.path)} " +
+            "-frames:v 1 -vf scale=320:-2 -f mjpeg - 2>/dev/null"
+        val bytes = execBinary(conn, cmd, 1024 * 1024)
+        return if (bytes.size > 512) bytes else null
+    }
+
+    /**
+     * קריאת קובץ שלם לזיכרון בלבד — בלי לשמור שום דבר בטלפון.
+     * נקרא במקביל בכמה ערוצים כדי שתמונה תיפתח מיד.
+     */
+    fun readToMemory(
+        conn: Connection,
+        remote: RemoteFile,
+        maxBytes: Long = 40L * 1024 * 1024,
+        parallel: Int = 4,
+        isCancelled: () -> Boolean = { false }
+    ): ByteArray? {
+        val size = remote.size.coerceAtMost(maxBytes).toInt()
+        if (size <= 0) return null
+        val out = ByteArray(size)
+        val slice = (size + parallel - 1) / parallel
+        val errors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+
+        val threads = (0 until parallel).map { i ->
+            Thread {
+                val from = i * slice
+                val to = minOf(size, from + slice)
+                if (from >= to) return@Thread
+                var client: SFTPv3Client? = null
+                try {
+                    val c = SFTPv3Client(conn).also { client = it }
+                    val handle = c.openFileRO(remote.path)
+                    try {
+                        var pos = from
+                        while (pos < to && !isCancelled()) {
+                            val n = c.read(handle, pos.toLong(), out, pos, to - pos)
+                            if (n <= 0) break
+                            pos += n
+                        }
+                    } finally {
+                        runCatching { c.closeFile(handle) }
+                    }
+                } catch (t: Throwable) {
+                    errors.set(t)
+                } finally {
+                    runCatching { client?.close() }
+                }
+            }.apply { isDaemon = true; start() }
+        }
+        threads.forEach { runCatching { it.join() } }
+        errors.get()?.let { throw it }
+        return if (isCancelled()) null else out
     }
 
     /** הורדת קובץ מהשרת עם התקדמות, בשביל צפייה בתוך האפליקציה. */

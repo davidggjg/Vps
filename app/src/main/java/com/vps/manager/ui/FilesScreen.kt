@@ -39,7 +39,6 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -131,31 +130,29 @@ fun FilesScreen(
         viewing = file
         cancelDownload = false
 
-        // סרטונים ושמע מנוגנים ישירות מהשרת, בלי הורדה
+        // סרטונים ושמע מנוגנים ישירות מהשרת
         if (kind == FileKind.Videos || kind == FileKind.Audio) {
             loadState = LoadState.Streaming
             return
         }
-        loadState = LoadState.Downloading(0, file.size)
+
+        // תמונות ומסמכים נטענים לזיכרון בלבד — בלי לשמור בטלפון
+        loadState = LoadState.Loading(0, file.size)
         scope.launch {
-            val dest = File(context.cacheDir, "remote/" + file.path.hashCode().toString() + "_" + file.name)
-            val ok = withContext(Dispatchers.IO) {
+            val bytes = withContext(Dispatchers.IO) {
                 runCatching {
-                    if (dest.exists() && dest.length() == file.size) true
-                    else RemoteFiles.download(
-                        conn, file, dest,
-                        onProgress = { done, total ->
-                            loadState = LoadState.Downloading(done, total)
-                        },
-                        isCancelled = { cancelDownload }
-                    )
+                    RemoteFiles.readToMemory(conn, file, isCancelled = { cancelDownload })
                 }
             }
-            loadState = ok.fold(
-                onSuccess = { done ->
-                    if (done) LoadState.Ready(dest) else null
+            loadState = bytes.fold(
+                onSuccess = { data ->
+                    when {
+                        cancelDownload -> null
+                        data == null -> LoadState.Failed("לא ניתן לקרוא את הקובץ")
+                        else -> LoadState.ImageReady(data)
+                    }
                 },
-                onFailure = { LoadState.Failed(it.message ?: "ההורדה נכשלה") }
+                onFailure = { LoadState.Failed(it.message ?: "הקריאה נכשלה") }
             )
             if (loadState == null) viewing = null
         }
@@ -512,30 +509,36 @@ private val thumbLimiter = Semaphore(3)
 private fun dateText(ms: Long): String =
     if (ms <= 0) "—" else SimpleDateFormat("dd/MM/yyyy", Locale("he")).format(Date(ms))
 
-/** תצוגה מקדימה לתמונות קטנות — נטענת רק כשהשורה נראית על המסך. */
+/** תצוגה מקדימה — נטענת לזיכרון בלבד, בלי לשמור קבצים בטלפון. */
 @Composable
 private fun Thumbnail(file: RemoteFile, kind: FileKind, session: SshSession) {
-    val context = LocalContext.current
     var bitmap by remember(file.path) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-    val eligible = kind == FileKind.Images && file.size in 1..(2L * 1024 * 1024)
+    val eligible = (kind == FileKind.Images && file.size in 1..(8L * 1024 * 1024)) ||
+        kind == FileKind.Videos
 
     LaunchedEffect(file.path) {
         if (!eligible) return@LaunchedEffect
         val conn = session.connection() ?: return@LaunchedEffect
-        val dest = File(context.cacheDir, "thumbs/" + file.path.hashCode() + ".img")
         val job = currentCoroutineContext()[kotlinx.coroutines.Job]
         val bmp = withContext(Dispatchers.IO) {
             runCatching {
-                if (!dest.exists() || dest.length() != file.size) {
-                    thumbLimiter.withPermit {
-                        RemoteFiles.download(conn, file, dest, { _, _ -> }) { job?.isActive != true }
-                    }
+                thumbLimiter.withPermit {
+                    if (job?.isActive != true) return@withPermit null
+                    val bytes = if (kind == FileKind.Videos) {
+                        RemoteFiles.videoThumbnail(conn, file)
+                    } else {
+                        RemoteFiles.readToMemory(conn, file, parallel = 2) { job?.isActive != true }
+                    } ?: return@withPermit null
+
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                    val max = maxOf(opts.outWidth, opts.outHeight).coerceAtLeast(1)
+                    val sample = generateSequence(1) { it * 2 }.first { max / it <= 200 }
+                    BitmapFactory.decodeByteArray(
+                        bytes, 0, bytes.size,
+                        BitmapFactory.Options().apply { inSampleSize = sample }
+                    )
                 }
-                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(dest.path, opts)
-                val max = maxOf(opts.outWidth, opts.outHeight).coerceAtLeast(1)
-                val sample = generateSequence(1) { it * 2 }.first { max / it <= 180 }
-                BitmapFactory.decodeFile(dest.path, BitmapFactory.Options().apply { inSampleSize = sample })
             }.getOrNull()
         }
         bitmap = bmp?.asImageBitmap()
@@ -551,6 +554,13 @@ private fun Thumbnail(file: RemoteFile, kind: FileKind, session: SshSession) {
         val bmp = bitmap
         if (bmp != null) {
             Image(bmp, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            if (kind == FileKind.Videos) {
+                Icon(
+                    Icons.Rounded.PlayCircle, null,
+                    tint = Color.White.copy(alpha = 0.9f),
+                    modifier = Modifier.size(22.dp)
+                )
+            }
         } else {
             Icon(
                 when (kind) {
