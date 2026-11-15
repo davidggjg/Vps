@@ -130,6 +130,12 @@ fun FilesScreen(
         val conn = session.connection() ?: return
         viewing = file
         cancelDownload = false
+
+        // סרטונים ושמע מנוגנים ישירות מהשרת, בלי הורדה
+        if (kind == FileKind.Videos || kind == FileKind.Audio) {
+            loadState = LoadState.Streaming
+            return
+        }
         loadState = LoadState.Downloading(0, file.size)
         scope.launch {
             val dest = File(context.cacheDir, "remote/" + file.path.hashCode().toString() + "_" + file.name)
@@ -424,6 +430,7 @@ fun FilesScreen(
             remote = current,
             kind = kind,
             state = ls,
+            connection = session.connection(),
             onCancel = {
                 cancelDownload = true
                 viewing = null

@@ -34,6 +34,8 @@ import java.io.File
 
 /** מצב ההורדה של קובץ לצפייה. */
 sealed interface LoadState {
+    /** ניגון ישירות מהשרת, בלי הורדה מראש. */
+    data object Streaming : LoadState
     data class Downloading(val done: Long, val total: Long) : LoadState
     data class Ready(val file: File) : LoadState
     data class Failed(val message: String) : LoadState
@@ -44,6 +46,7 @@ fun MediaViewerDialog(
     remote: RemoteFile,
     kind: FileKind,
     state: LoadState,
+    connection: com.trilead.ssh2.Connection?,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
     onRetry: () -> Unit
@@ -58,6 +61,11 @@ fun MediaViewerDialog(
                 .background(Color.Black.copy(alpha = 0.96f))
         ) {
             when (state) {
+                is LoadState.Streaming ->
+                    if (connection != null) StreamPlayer(remote, connection)
+                    else Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("אין חיבור פעיל לשרת", color = Color.White)
+                    }
                 is LoadState.Downloading -> DownloadProgress(remote, state, onCancel)
                 is LoadState.Failed -> Column(
                     Modifier.align(Alignment.Center).padding(32.dp),
@@ -184,6 +192,50 @@ private fun ZoomableImage(file: File) {
             }
             .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offsetX, translationY = offsetY)
     )
+}
+
+/** נגן שמזרים את הקובץ מהשרת דרך SFTP — בלי להוריד אותו קודם. */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun StreamPlayer(remote: RemoteFile, conn: com.trilead.ssh2.Connection) {
+    val context = LocalContext.current
+    var error by remember { mutableStateOf<String?>(null) }
+
+    val player = remember(remote.path) {
+        ExoPlayer.Builder(context).build().apply {
+            val source = androidx.media3.exoplayer.source.ProgressiveMediaSource
+                .Factory(com.vps.manager.ssh.SftpDataSource.factory(conn))
+                .createMediaSource(
+                    MediaItem.fromUri(com.vps.manager.ssh.SftpDataSource.uriFor(remote.path))
+                )
+            setMediaSource(source)
+            prepare()
+            playWhenReady = true
+            addListener(object : androidx.media3.common.Player.Listener {
+                override fun onPlayerError(e: androidx.media3.common.PlaybackException) {
+                    error = "לא ניתן לנגן את הקובץ מהשרת: ${e.errorCodeName}"
+                }
+            })
+        }
+    }
+    DisposableEffect(remote.path) { onDispose { player.release() } }
+
+    Box(Modifier.fillMaxSize()) {
+        AndroidView(
+            factory = { ctx -> PlayerView(ctx).apply { this.player = player; useController = true } },
+            modifier = Modifier.fillMaxSize()
+        )
+        error?.let {
+            Column(
+                Modifier.align(Alignment.Center).padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(Icons.Rounded.ErrorOutline, null, tint = Ios.red, modifier = Modifier.size(42.dp))
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = Color.White, textAlign = TextAlign.Center)
+            }
+        }
+    }
 }
 
 @Composable
