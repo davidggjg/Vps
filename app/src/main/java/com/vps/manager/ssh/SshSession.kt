@@ -80,7 +80,7 @@ class SshSession(
     }
 
     private fun ping(): Boolean = try {
-        conn?.ping(); true
+        conn?.sendIgnorePacket(); true
     } catch (t: Throwable) { false }
 
     private fun startConnectThread(isRetry: Boolean) {
@@ -93,6 +93,10 @@ class SshSession(
                 _state.value = ConnState.Connected
                 _status.value = "מחובר · ${server.user}@${server.host}"
                 if (isRetry) notice("החיבור חזר — ממשיכים מאותו מקום")
+                queuedCommand?.let { pendingCmd ->
+                    queuedCommand = null
+                    run(pendingCmd)
+                }
             } catch (t: Throwable) {
                 teardown()
                 if (!wanted) return@Thread
@@ -177,8 +181,7 @@ class SshSession(
     }
 
     private fun teardown() {
-        conn?.let { SftpPool.release(it) }
-        closeTransferConnections()
+        closeWorkConnections()
         runCatching { shell?.close() }
         runCatching { conn?.close() }
         shell = null; conn = null; stdin = null
@@ -217,12 +220,19 @@ class SshSession(
 
     private fun startKeepAlive(c: Connection) {
         Thread {
+            var failures = 0
             while (wanted && conn === c) {
                 try { Thread.sleep(20_000) } catch (_: InterruptedException) { return@Thread }
                 if (conn !== c) return@Thread
-                try { c.ping() } catch (_: Throwable) {
-                    if (wanted && conn === c) scheduleReconnect("אין תגובה מהשרת")
-                    return@Thread
+                try {
+                    c.sendIgnorePacket()
+                    failures = 0
+                } catch (_: Throwable) {
+                    failures++
+                    if (failures >= 2) {
+                        if (wanted && conn === c) scheduleReconnect("אין תגובה מהשרת")
+                        return@Thread
+                    }
                 }
             }
         }.apply { isDaemon = true; name = "ssh-keepalive" }.start()
@@ -239,14 +249,31 @@ class SshSession(
         _blocks.value = _blocks.value + block
         val begin = "printf '\\001VPSB_%s\\n' $id"
         val end = "printf '\\002VPSE_%s_%s_%s\\n' $id \"\$__VRC\" \"\$PWD\""
-        writeLine("$begin; $cmd; __VRC=\$?; $end")
+        val sent = sendRaw("$begin; $cmd; __VRC=\$?; $end\n")
+        if (!sent) {
+            // החיבור נפל לפני שהפקודה יצאה — שומרים אותה ושולחים שוב אחרי החיבור
+            queuedCommand = cmd
+            _blocks.value = _blocks.value.map {
+                if (it.id == id) it.copy(
+                    running = false,
+                    output = "החיבור נפל לפני שהפקודה נשלחה. היא תרוץ שוב אוטומטית ברגע שהחיבור יחזור.",
+                    finishedAt = System.currentTimeMillis()
+                ) else it
+            }
+        }
     }
 
+    @Volatile private var queuedCommand: String? = null
+
     /** שליחת טקסט גולמי — למשל סיסמה לשאלה של sudo, או Ctrl+C. */
-    fun sendRaw(text: String) {
-        try {
-            stdin?.write(text.toByteArray(Charsets.UTF_8)); stdin?.flush()
-        } catch (_: Throwable) { scheduleReconnect("לא ניתן לשלוח לשרת") }
+    fun sendRaw(text: String): Boolean = try {
+        val out = stdin ?: throw IllegalStateException("אין ערוץ פתוח")
+        out.write(text.toByteArray(Charsets.UTF_8))
+        out.flush()
+        true
+    } catch (_: Throwable) {
+        scheduleReconnect("לא ניתן לשלוח לשרת")
+        false
     }
 
     fun sendCtrlC() = sendRaw("\u0003")
@@ -256,16 +283,18 @@ class SshSession(
     /** החיבור הפתוח — לשימוש פעולות קבצים (SFTP/exec) על אותו ערוץ מאובטח. */
     fun connection(): Connection? = conn
 
-    // חיבורים נוספים להעברת קבצים. כל חיבור SSH מוגבל במספר ערוצים ובגודל חלון,
-    // ולכן כמה חיבורים במקביל מכפילים את מהירות ההזרמה.
-    private val transferConns = arrayOfNulls<Connection>(TRANSFER_CONNECTIONS)
+    // חיבורי עבודה נפרדים לקבצים ולמדיה.
+    // חשוב: אף פעולת קבצים לא רצה על חיבור המסוף — סגירת ערוץ באמצע שטף פלט
+    // (למשל find שעדיין רץ) מפילה את כל החיבור, ואיתו את המסוף.
+    private val workConns = arrayOfNulls<Connection>(WORK_CONNECTIONS)
 
     @Synchronized
-    private fun transferConnection(index: Int): Connection? {
-        transferConns[index]?.let { existing ->
+    private fun workConnection(index: Int): Connection? {
+        workConns[index]?.let { existing ->
             if (runCatching { existing.sendIgnorePacket(); true }.getOrDefault(false)) return existing
+            SftpPool.release(existing)
             runCatching { existing.close() }
-            transferConns[index] = null
+            workConns[index] = null
         }
         val s = server
         return runCatching {
@@ -275,23 +304,23 @@ class SshSession(
                 c.authenticateWithPublicKey(s.user, s.privateKey.toCharArray(), s.keyPassphrase.ifBlank { null })
             else
                 c.authenticateWithPassword(s.user, s.password)
-            if (!ok) { c.close(); null } else { transferConns[index] = c; c }
+            if (!ok) { c.close(); null } else { workConns[index] = c; c }
         }.getOrNull()
     }
 
-    /** כל החיבורים שאפשר להשתמש בהם להעברת קבצים — הראשי ועוד כמה. */
-    fun transferConnections(): List<Connection> {
-        val main = conn ?: return emptyList()
-        val extra = (0 until TRANSFER_CONNECTIONS).mapNotNull { transferConnection(it) }
-        return listOf(main) + extra
-    }
+    /** חיבור לפעולות קבצים קצרות (סריקה, תמונות ממוזערות, מחיקה). */
+    fun fileConnection(): Connection? = workConnection(0)
+
+    /** כל חיבורי העבודה — להזרמת וידאו בכמה ערוצים במקביל. */
+    fun transferConnections(): List<Connection> =
+        (0 until WORK_CONNECTIONS).mapNotNull { workConnection(it) }
 
     @Synchronized
-    private fun closeTransferConnections() {
-        transferConns.indices.forEach { i ->
-            transferConns[i]?.let { SftpPool.release(it) }
-            runCatching { transferConns[i]?.close() }
-            transferConns[i] = null
+    private fun closeWorkConnections() {
+        workConns.indices.forEach { i ->
+            workConns[i]?.let { SftpPool.release(it) }
+            runCatching { workConns[i]?.close() }
+            workConns[i] = null
         }
     }
 
@@ -370,8 +399,8 @@ class SshSession(
     }
 
     companion object {
-        /** מספר חיבורי ההעברה הנוספים (מעבר לחיבור הראשי). */
-        const val TRANSFER_CONNECTIONS = 2
+        /** חיבורי עבודה ייעודיים לקבצים ולמדיה, בנפרד מהמסוף. */
+        const val WORK_CONNECTIONS = 3
 
         fun shellQuote(s: String) = "'" + s.replace("'", "'\\''") + "'"
     }

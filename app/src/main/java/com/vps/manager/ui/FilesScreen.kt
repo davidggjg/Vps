@@ -89,15 +89,10 @@ fun FilesScreen(
     LaunchedEffect(kind, root, refreshKey) {
         loading = true; error = null; selected = emptySet()
         filesFlow.value = emptyList()
-        val conn = session.connection()
-        if (conn == null) {
-            error = "אין חיבור פעיל לשרת"
-            loading = false
-            return@LaunchedEffect
-        }
         val job = currentCoroutineContext()[kotlinx.coroutines.Job]
         val result = withContext(Dispatchers.IO) {
             runCatching {
+                val conn = session.fileConnection() ?: error("אין חיבור פעיל לשרת")
                 val acc = ArrayList<RemoteFile>(512)
                 RemoteFiles.scanStream(
                     conn = conn,
@@ -126,7 +121,6 @@ fun FilesScreen(
     }
 
     fun startView(file: RemoteFile) {
-        val conn = session.connection() ?: return
         viewing = file
         cancelDownload = false
 
@@ -141,6 +135,7 @@ fun FilesScreen(
         scope.launch {
             val bytes = withContext(Dispatchers.IO) {
                 runCatching {
+                    val conn = session.fileConnection() ?: error("אין חיבור פעיל לשרת")
                     RemoteFiles.readToMemory(conn, file, isCancelled = { cancelDownload })
                 }
             }
@@ -159,10 +154,12 @@ fun FilesScreen(
     }
 
     fun doDelete(list: List<RemoteFile>) {
-        val conn = session.connection() ?: return
         scope.launch {
             val res = withContext(Dispatchers.IO) {
-                runCatching { RemoteFiles.delete(conn, list.map { it.path }) }
+                runCatching {
+                    val conn = session.fileConnection() ?: error("אין חיבור פעיל לשרת")
+                    RemoteFiles.delete(conn, list.map { it.path })
+                }
             }
             res.onSuccess {
                 val gone = list.map { it.path }.toSet()
@@ -518,10 +515,10 @@ private fun Thumbnail(file: RemoteFile, kind: FileKind, session: SshSession) {
 
     LaunchedEffect(file.path) {
         if (!eligible) return@LaunchedEffect
-        val conn = session.connection() ?: return@LaunchedEffect
         val job = currentCoroutineContext()[kotlinx.coroutines.Job]
         val bmp = withContext(Dispatchers.IO) {
             runCatching {
+                val conn = session.fileConnection() ?: return@runCatching null
                 thumbLimiter.withPermit {
                     if (job?.isActive != true) return@withPermit null
                     val bytes = when {
