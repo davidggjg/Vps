@@ -34,6 +34,9 @@ import com.vps.manager.ssh.RemoteFiles
 import com.vps.manager.ssh.SshSession
 import com.vps.manager.ssh.humanSize
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -57,10 +60,12 @@ fun FilesScreen(
 
     var kind by remember { mutableStateOf(FileKind.Images) }
     var root by remember { mutableStateOf(prefs.lastSearchRoot) }
-    var files by remember { mutableStateOf<List<RemoteFile>>(emptyList()) }
+    val filesFlow = remember { kotlinx.coroutines.flow.MutableStateFlow<List<RemoteFile>>(emptyList()) }
+    val files by filesFlow.collectAsState()
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var refreshKey by remember { mutableIntStateOf(0) }
+    var elapsed by remember { mutableIntStateOf(0) }
 
     var query by remember { mutableStateOf("") }
     var sortBy by remember { mutableStateOf(SortBy.Size) }
@@ -73,19 +78,40 @@ fun FilesScreen(
     var rootDialog by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
 
+    LaunchedEffect(loading) {
+        elapsed = 0
+        while (loading) {
+            kotlinx.coroutines.delay(1000)
+            elapsed++
+        }
+    }
+
+    // סריקה זורמת: תוצאות מופיעות תוך כדי, ונעצרת מיד אם עוברים לשונית או יוצאים.
     LaunchedEffect(kind, root, refreshKey) {
         loading = true; error = null; selected = emptySet()
+        filesFlow.value = emptyList()
         val conn = session.connection()
         if (conn == null) {
             error = "אין חיבור פעיל לשרת"
-            files = emptyList()
             loading = false
             return@LaunchedEffect
         }
+        val job = currentCoroutineContext()[kotlinx.coroutines.Job]
         val result = withContext(Dispatchers.IO) {
-            runCatching { RemoteFiles.scan(conn, kind, root) }
+            runCatching {
+                val acc = ArrayList<RemoteFile>(512)
+                RemoteFiles.scanStream(
+                    conn = conn,
+                    kind = kind,
+                    root = root,
+                    isCancelled = { job?.isActive != true }
+                ) { batch ->
+                    acc.addAll(batch)
+                    filesFlow.value = ArrayList(acc)
+                }
+            }
         }
-        result.onSuccess { files = it }.onFailure { error = it.message ?: "הסריקה נכשלה" }
+        result.onFailure { error = it.message ?: "הסריקה נכשלה" }
         loading = false
     }
 
@@ -137,7 +163,7 @@ fun FilesScreen(
             }
             res.onSuccess {
                 val gone = list.map { it.path }.toSet()
-                files = files.filterNot { it.path in gone }
+                filesFlow.value = filesFlow.value.filterNot { it.path in gone }
                 selected = emptySet()
                 snackbar.showSnackbar("נמחקו ${list.size} קבצים")
             }.onFailure {
@@ -165,7 +191,8 @@ fun FilesScreen(
                     Column(Modifier.weight(1f)) {
                         Text("קבצים ומדיה", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            if (loading) "סורק את השרת…" else "${shown.size} פריטים · תיקיית סריקה: $root",
+                            if (loading) "סורק… נמצאו ${files.size} עד כה"
+                            else "${shown.size} פריטים · ${if (root == "/") "כל השרת" else root}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1
@@ -267,15 +294,22 @@ fun FilesScreen(
 
             Box(Modifier.weight(1f)) {
                 when {
-                    loading -> Column(
+                    loading && files.isEmpty() -> Column(
                         Modifier.align(Alignment.Center),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(color = Ios.blue)
                         Spacer(Modifier.height(12.dp))
                         Text(
-                            "מחפש ${kind.title} בשרת…",
+                            "מחפש ${kind.title} בשרת…  ${elapsed} שנ׳",
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "סריקה ראשונה של כל השרת לוקחת כמה שניות.\nאפשר לצמצם לתיקייה דרך אייקון התיקייה למעלה.",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
                         )
                     }
                     error != null -> Text(
@@ -349,11 +383,11 @@ fun FilesScreen(
         var temp by remember { mutableStateOf(root) }
         AlertDialog(
             onDismissRequest = { rootDialog = false },
-            title = { Text("מאיפה לסרוק?") },
+            title = { Text("איפה לחפש?") },
             text = {
                 Column {
                     Text(
-                        "אפשר לצמצם את הסריקה לתיקייה מסוימת כדי שתהיה מהירה יותר.",
+                        "ברירת המחדל היא כל השרת (/) — כל התיקיות וכל הקבצים.\nאפשר לצמצם לנתיב מסוים כדי לחפש רק שם.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Spacer(Modifier.height(10.dp))
@@ -366,7 +400,7 @@ fun FilesScreen(
                     )
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("/", "/home", "/var/www", "/root").forEach {
+                        listOf("/", "/home", "/var/www", "/root", "/opt").forEach {
                             AssistChip(onClick = { temp = it }, label = { Text(it) })
                         }
                     }
@@ -465,6 +499,9 @@ private fun FileRow(
     }
 }
 
+/** מגביל כמה תמונות נמשכות במקביל, כדי שהגלילה תישאר חלקה. */
+private val thumbLimiter = Semaphore(3)
+
 private fun dateText(ms: Long): String =
     if (ms <= 0) "—" else SimpleDateFormat("dd/MM/yyyy", Locale("he")).format(Date(ms))
 
@@ -473,16 +510,19 @@ private fun dateText(ms: Long): String =
 private fun Thumbnail(file: RemoteFile, kind: FileKind, session: SshSession) {
     val context = LocalContext.current
     var bitmap by remember(file.path) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-    val eligible = kind == FileKind.Images && file.size in 1..(4L * 1024 * 1024)
+    val eligible = kind == FileKind.Images && file.size in 1..(2L * 1024 * 1024)
 
     LaunchedEffect(file.path) {
         if (!eligible) return@LaunchedEffect
         val conn = session.connection() ?: return@LaunchedEffect
         val dest = File(context.cacheDir, "thumbs/" + file.path.hashCode() + ".img")
+        val job = currentCoroutineContext()[kotlinx.coroutines.Job]
         val bmp = withContext(Dispatchers.IO) {
             runCatching {
                 if (!dest.exists() || dest.length() != file.size) {
-                    RemoteFiles.download(conn, file, dest, { _, _ -> }, { false })
+                    thumbLimiter.withPermit {
+                        RemoteFiles.download(conn, file, dest, { _, _ -> }) { job?.isActive != true }
+                    }
                 }
                 val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeFile(dest.path, opts)

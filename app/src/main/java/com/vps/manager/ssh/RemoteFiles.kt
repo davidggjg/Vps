@@ -39,20 +39,28 @@ object RemoteFiles {
 
     fun quote(path: String) = "'" + path.replace("'", "'\\''") + "'"
 
-    /** מריץ פקודה קצרה ומחזיר את הפלט המלא. */
-    fun exec(conn: Connection, command: String, timeoutMs: Long = 120_000): String {
+    /** מריץ פקודה ומחזיר את הפלט המלא. קורא גם stderr כדי שהפקודה לא תיתקע. */
+    fun exec(conn: Connection, command: String, timeoutMs: Long = 180_000): String {
         val session = conn.openSession()
         try {
             session.execCommand(command)
             val out = StreamGobbler(session.stdout)
+            val err = StreamGobbler(session.stderr)
+            val drain = Thread {
+                val b = ByteArray(8192)
+                try { while (err.read(b) >= 0) { /* נזרק */ } } catch (_: Throwable) {}
+            }.apply { isDaemon = true; start() }
+
             val sb = StringBuilder()
-            val buf = ByteArray(16 * 1024)
+            val buf = ByteArray(64 * 1024)
             val deadline = System.currentTimeMillis() + timeoutMs
-            while (System.currentTimeMillis() < deadline) {
+            while (true) {
                 val n = out.read(buf)
                 if (n < 0) break
                 sb.append(String(buf, 0, n, Charsets.UTF_8))
+                if (System.currentTimeMillis() > deadline) break
             }
+            runCatching { drain.interrupt() }
             return sb.toString()
         } finally {
             runCatching { session.close() }
@@ -60,27 +68,93 @@ object RemoteFiles {
     }
 
     /**
-     * סורק את השרת ומחזיר קבצים מהסוג המבוקש, הגדולים ביותר קודם.
-     * מוגבל למערכת הקבצים הראשית כדי לא להיתקע על תיקיות מערכת.
+     * רק מערכות קבצים וירטואליות של הליבה — אין בהן קבצים אמיתיים,
+     * והן מה שגורם לסריקה להיתקע. כל שאר השרת נסרק במלואו.
      */
+    private val PRUNED = listOf("/proc", "/sys", "/dev", "/run", "/var/lib/lxcfs")
+
+    private fun pruneExpr(root: String): String {
+        val inside = PRUNED.filter { root == "/" || it.startsWith(root) }
+        if (inside.isEmpty()) return ""
+        return inside.joinToString(" -o ") { "-path ${quote(it)}" }.let { "\\( $it \\) -prune -o " }
+    }
+
+    private fun findCommand(kind: FileKind, root: String, minSizeKb: Long, limit: Int): String {
+        val nameFilter = if (kind.patterns.isEmpty()) "" else
+            kind.patterns.joinToString(" -o ") { "-iname '*.$it'" }.let { "\\( $it \\) " }
+        return "find ${quote(root)} ${pruneExpr(root)}-type f $nameFilter-size +${minSizeKb}k " +
+            "-printf '%s\\t%T@\\t%p\\n' 2>/dev/null | head -n $limit"
+    }
+
+    /**
+     * סריקה זורמת: מחזירה קבצים תוך כדי החיפוש, כך שרואים תוצאות מיד
+     * ולא מחכים שהשרת יסיים לעבור על הכול.
+     */
+    fun scanStream(
+        conn: Connection,
+        kind: FileKind,
+        root: String = "/",
+        minSizeKb: Long = if (kind == FileKind.Largest) 20_480 else 8,
+        limit: Int = 20_000,
+        isCancelled: () -> Boolean,
+        onBatch: (List<RemoteFile>) -> Unit
+    ) {
+        val session = conn.openSession()
+        try {
+            session.execCommand(findCommand(kind, root, minSizeKb, limit))
+            val out = StreamGobbler(session.stdout)
+            val err = StreamGobbler(session.stderr)
+            Thread {
+                val b = ByteArray(8192)
+                try { while (err.read(b) >= 0) { /* נזרק */ } } catch (_: Throwable) {}
+            }.apply { isDaemon = true; start() }
+
+            val buf = ByteArray(64 * 1024)
+            val pending = StringBuilder()
+            val batch = ArrayList<RemoteFile>(64)
+            var lastFlush = System.currentTimeMillis()
+
+            while (!isCancelled()) {
+                val n = out.read(buf)
+                if (n < 0) break
+                pending.append(String(buf, 0, n, Charsets.UTF_8))
+                var nl = pending.indexOf("\n")
+                while (nl >= 0) {
+                    parseLine(pending.substring(0, nl))?.let { batch.add(it) }
+                    pending.delete(0, nl + 1)
+                    nl = pending.indexOf("\n")
+                }
+                val now = System.currentTimeMillis()
+                if (batch.isNotEmpty() && (batch.size >= 120 || now - lastFlush > 400)) {
+                    onBatch(ArrayList(batch)); batch.clear(); lastFlush = now
+                }
+            }
+            parseLine(pending.toString())?.let { batch.add(it) }
+            if (batch.isNotEmpty()) onBatch(batch)
+        } finally {
+            runCatching { session.close() }
+        }
+    }
+
+    /** סריקה רגילה (לא זורמת) — מחזירה הכול בבת אחת. */
     fun scan(
         conn: Connection,
         kind: FileKind,
         root: String = "/",
-        minSizeKb: Long = if (kind == FileKind.Largest) 10_240 else 4,
-        limit: Int = 500
+        minSizeKb: Long = if (kind == FileKind.Largest) 20_480 else 8,
+        limit: Int = 20_000
     ): List<RemoteFile> {
-        val nameFilter = if (kind.patterns.isEmpty()) "" else
-            kind.patterns.joinToString(" -o ") { "-iname '*.$it'" }.let { "\\( $it \\) " }
-        val base = "find ${quote(root)} -xdev -type f $nameFilter-size +${minSizeKb}k"
-        val gnu = "$base -printf '%s\\t%T@\\t%p\\n' 2>/dev/null | sort -t'\\t' -k1,1nr | head -n $limit"
-        var raw = exec(conn, gnu)
+        var raw = exec(conn, findCommand(kind, root, minSizeKb, limit))
         if (raw.isBlank()) {
-            val busybox = "$base -print0 2>/dev/null | xargs -0 -r stat -c '%s\\t%Y\\t%n' 2>/dev/null | " +
-                "sort -t'\\t' -k1,1nr | head -n $limit"
-            raw = exec(conn, busybox)
+            val nameFilter = if (kind.patterns.isEmpty()) "" else
+                kind.patterns.joinToString(" -o ") { "-iname '*.$it'" }.let { "\\( $it \\) " }
+            raw = exec(
+                conn,
+                "find ${quote(root)} ${pruneExpr(root)}-type f $nameFilter-size +${minSizeKb}k " +
+                    "-print0 2>/dev/null | xargs -0 -r stat -c '%s\\t%Y\\t%n' 2>/dev/null | head -n $limit"
+            )
         }
-        return parse(raw)
+        return parse(raw).sortedByDescending { it.size }
     }
 
     /** קבצים בתיקייה אחת (דפדפן הקבצים). */
@@ -96,18 +170,42 @@ object RemoteFiles {
         return dirs to files
     }
 
-    private fun parse(raw: String): List<RemoteFile> = raw.lines().mapNotNull { line ->
-        if (line.isBlank()) return@mapNotNull null
+    private fun parse(raw: String): List<RemoteFile> = raw.lines().mapNotNull { parseLine(it) }
+
+    private fun parseLine(line: String): RemoteFile? {
+        if (line.isBlank()) return null
         val parts = line.split("\t")
-        if (parts.size < 3) return@mapNotNull null
-        val size = parts[0].trim().toLongOrNull() ?: return@mapNotNull null
+        if (parts.size < 3) return null
+        val size = parts[0].trim().toLongOrNull() ?: return null
         val mtime = parts[1].trim().substringBefore('.').toLongOrNull() ?: 0L
         val path = parts.subList(2, parts.size).joinToString("\t").trim()
-        if (path.isBlank()) null else RemoteFile(path, size, mtime * 1000L)
+        return if (path.isBlank()) null else RemoteFile(path, size, mtime * 1000L)
     }
 
     fun delete(conn: Connection, paths: List<String>): String =
         exec(conn, "rm -f -- " + paths.joinToString(" ") { quote(it) } + " && echo OK")
+
+    @Volatile private var cachedConn: Connection? = null
+    @Volatile private var cachedSftp: SFTPv3Client? = null
+
+    /** לקוח SFTP משותף — פתיחת ערוץ חדש לכל תמונה היא מה שמאט. */
+    @Synchronized
+    private fun sftp(conn: Connection): SFTPv3Client {
+        val existing = cachedSftp
+        if (existing != null && cachedConn === conn) return existing
+        runCatching { existing?.close() }
+        val fresh = SFTPv3Client(conn)
+        cachedConn = conn
+        cachedSftp = fresh
+        return fresh
+    }
+
+    @Synchronized
+    fun dropCache() {
+        runCatching { cachedSftp?.close() }
+        cachedSftp = null
+        cachedConn = null
+    }
 
     /** הורדת קובץ מהשרת עם התקדמות, בשביל צפייה בתוך האפליקציה. */
     fun download(
@@ -117,12 +215,12 @@ object RemoteFiles {
         onProgress: (Long, Long) -> Unit,
         isCancelled: () -> Boolean
     ): Boolean {
-        val sftp = SFTPv3Client(conn)
+        val sftp = sftp(conn)
         try {
             val handle = sftp.openFileRO(remote.path)
             dest.parentFile?.mkdirs()
             FileOutputStream(dest).use { fos ->
-                val buf = ByteArray(64 * 1024)
+                val buf = ByteArray(32 * 1024)
                 var offset = 0L
                 while (true) {
                     if (isCancelled()) return false
@@ -135,8 +233,9 @@ object RemoteFiles {
             }
             runCatching { sftp.closeFile(handle) }
             return true
-        } finally {
-            runCatching { sftp.close() }
+        } catch (t: Throwable) {
+            dropCache()
+            throw t
         }
     }
 }
